@@ -2,11 +2,15 @@ from typing import Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from qiskit import QuantumCircuit
-from qiskit_aer import AerSimulator
+from qiskit_aer import AerSimulator, QasmSimulator
 from qiskit.primitives import Sampler
 import qiskit.quantum_info as qi
-
+from qiskit.quantum_info import entropy
+from qiskit import transpile
 import numpy as np
+import json
+
+from qiskit.quantum_info import Statevector, DensityMatrix, partial_trace
 
 
 app = FastAPI()
@@ -19,88 +23,69 @@ app.add_middleware(
 )
 
 
-# # # Define a normalized complex state vector
-# # # Example: |ψ> = (1/√2)|00> + (i/√2)|11>
-# # bell_state_vector = [1/np.sqrt(2), 0, 0, 1j/np.sqrt(2)]
-
-
-
-# # # Define the normalized amplitudes for qubit 0
-# # q0_amplitudes = [1, 0]  # Qubit 0: |q0> = (1/sqrt(30))|0> + (2i/sqrt(30))|1>
-
-# # Define the normalized amplitudes for qubit 0
-# q0_amplitudes = [ (1 + 1j) / np.sqrt(2), (2 - 1j) / np.sqrt(5)]  # Qubit 0: |q0> = (1 + i)/sqrt(2) |0> + (2 - i)/sqrt(5) |1>
-
-
-# # Normalize the amplitudes (if necessary)
-# norm = np.sqrt(np.abs(q0_amplitudes[0])**2 + np.abs(q0_amplitudes[1])**2)
-# q0_amplitudes = [amp / norm for amp in q0_amplitudes]
-
-# print(f"Normalized amplitudes: {q0_amplitudes}")
-# q1_amplitudes = [0, 1]  # Qubit 1: |q1> = (10/sqrt(104))|0> + (2i/sqrt(104))|1>
-
-# # Tensor product to get the full system state
-# full_state = np.kron(q0_amplitudes, q1_amplitudes)
-# num_q = 15
-n_sample=1000
-
-
 @app.get("/")
 async def root():
-
-    # # Create circuit with 2 qubits and 2 classical bits
-    # circuit = QuantumCircuit(num_q)
-
-    # # # Create Bell state (Φ⁺)
-    # circuit.h(0)      # Apply Hadamard gate to first qubit
-    # circuit.cx(0, 1)  # CNOT with first qubit as control, second as target
-
-    # # # Initialize the qubits to the desired state
-    # # circuit.initialize(state_vector, [0, 1])
-
-
-    # # Initialize the qubits to the desired state
-    # # circuit.initialize(full_state, [0, 1])
-
-    # circuit.initialize(q0_amplitudes, [0])
-    # circuit.initialize(q1_amplitudes, [1])
-    # # 85 3 10 0.5
-
-    
-    # # circuit.save_statevector()  # Save statevector at this point
-
-    # # stv1 = qi.Statevector.from_instruction(circuit)
-    # # print(stv1)
-    # # latex = stv1.draw('latex_source')
-    # # print(latex)
-
-
-    # # Add measurements
-    # circuit.measure_all()
-
-    # # Execute the circuit using the new Sampler primitive
-    # sampler = Sampler()
-    # job = sampler.run(circuit, shots=n_sample)
-    # result = job.result()
-    # counts = result.quasi_dists[0]
-
-    # message = ''
-    # for state, probability in counts.items():
-    #     # Convert binary number to bit string
-    #     bit_string = format(state, f'0{num_q}b')
-    #     count = int(probability * n_sample)
-    #     message += f"|{bit_string}> : {count} times ({probability*100:.1f}%)\n"
-
-
     return {"message": 'ok'}
 
 @app.get("/items/{item_id}")
 def read_item(item_id: int, q: Optional[str] = None):
     return {"item_id": item_id, "q": q}
 
+
+def check_entanglement(circuit: QuantumCircuit, qubit1: int = 0, qubit2: int = 1):
+    """
+    Check entanglement between two qubits in a quantum circuit.
+    
+    Args:
+        circuit (QuantumCircuit): The quantum circuit to analyze
+        qubit1 (int): First qubit index
+        qubit2 (int): Second qubit index
+        
+    Returns:
+        dict: Dictionary containing different entanglement measures
+    """
+    # Create simulator and get statevector
+    simulator = AerSimulator()
+    transpiled_circuit = transpile(circuit, simulator)
+    
+    # Get the state vector
+    state = qi.Statevector.from_instruction(transpiled_circuit)
+    
+    # Convert to density matrix
+    rho = qi.DensityMatrix(state)
+    
+    # Get the reduced density matrix for the two qubits of interest
+    other_qubits = [i for i in range(circuit.num_qubits) if i not in [qubit1, qubit2]]
+    reduced_rho = qi.partial_trace(rho, other_qubits)
+    
+    # Calculate reduced density matrices for individual qubits
+    rho_1 = qi.partial_trace(reduced_rho, [1])
+    rho_2 = qi.partial_trace(reduced_rho, [0])
+    
+    # Calculate von Neumann entropy
+    entropy_1 = qi.entropy(rho_1)
+    entropy_2 = qi.entropy(rho_2)
+    entropy_12 = qi.entropy(reduced_rho)
+    
+    # Calculate mutual information
+    mutual_info = entropy_1 + entropy_2 - entropy_12
+    
+    # Calculate concurrence for 2-qubit state
+    if reduced_rho.dim == (4, 4):  # Only for 2-qubit states
+        try:
+            concurrence = qi.concurrence(reduced_rho)
+        except:
+            concurrence = None
+    else:
+        concurrence = None
+    
+    # Check if the state is entangled
+    is_entangled = mutual_info > 1e-10
+    return is_entangled
+    
 @app.post("/measure")
 async def measure(payload: dict):
-    # Create circuit with 2 qubits and 2 classical bits
+    # Create circuit with n qubits and n classical bits
     num_q = len(payload['qubits'])
     circuit = QuantumCircuit(num_q)
 
@@ -116,23 +101,44 @@ async def measure(payload: dict):
         ]
         circuit.__getattribute__(action['gate'])(*qubit_indexes)
 
+
     
+    state = qi.Statevector.from_instruction(circuit)
+    entanglement = None
+    last_action = payload['actions'][-1]
+    if last_action and last_action['gate'] == 'cx':
+        indicies_of_cx_qubits = [next(i for i, qubit in enumerate(payload['qubits']) if qubit['id'] == arg) for arg in last_action['args']] 
+        entanglement = check_entanglement(circuit, indicies_of_cx_qubits[0], indicies_of_cx_qubits[1])
+        entanglement = bool(entanglement)
+        print("entanglement", entanglement)
+
+    latex = state.draw('latex_source')
+
     # Add measurements
     circuit.measure_all()
 
-    # Execute the circuit using the new Sampler primitive
-    sampler = Sampler()
-    job = sampler.run(circuit, shots=n_sample)
-    result = job.result()
-    counts = result.quasi_dists[0]
+    # For execution
+    simulator = AerSimulator()
+    compiled_circuit = transpile(circuit, simulator)
+    sim_result = simulator.run(compiled_circuit).result()
+    
+    # Get the counts and calculate probabilities
+    counts = sim_result.get_counts()
+    total_shots = sum(counts.values())
+    probabilities = {state: count / total_shots for state, count in counts.items()}
 
-    message = ''
-    for state, probability in counts.items():
-        # Convert binary number to bit string
-        bit_string = format(state, f'0{num_q}b')
-        count = int(probability * n_sample)
-        message += f"|{bit_string}> : {count} times ({probability*100:.1f}%)\n"
+    # Find the most frequent measurement
+    measurement = max(counts, key=counts.get)
 
-    print('message', message)
+    result = {
+        "entanglement": entanglement,
+        "circuit": str(circuit),
+        "measurement": measurement,
+        "probabilities": probabilities,
+        "qubits": payload['qubits'],
+        # state: state,
+        "latex": latex
+    }
+    
 
-    return {"message": "Data received", "payload": payload, message: message}
+    return result
